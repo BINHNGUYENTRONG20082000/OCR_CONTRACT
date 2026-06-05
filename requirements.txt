@@ -1,0 +1,17 @@
+#torch==2.6.0
+transformers==4.46.3
+tokenizers==0.20.3
+accelerate
+einops
+addict 
+easydict
+#torchvision
+# flash-attn is optional and may not be available on Windows
+# Uncomment and install manually if needed for Linux/GPU acceleration
+# flash-attn
+PyMuPDF
+hf_transfer
+gradio
+spaces
+pillow
+numpy
