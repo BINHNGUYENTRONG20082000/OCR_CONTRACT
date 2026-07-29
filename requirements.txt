@@ -1,17 +1,30 @@
-#torch==2.6.0
-transformers==4.46.3
-tokenizers==0.20.3
-accelerate
-einops
-addict 
-easydict
-#torchvision
-# flash-attn is optional and may not be available on Windows
-# Uncomment and install manually if needed for Linux/GPU acceleration
-# flash-attn
-PyMuPDF
-hf_transfer
-gradio
-spaces
+# === OCR (PP-OCRv6 + ONNXRuntime GPU) ===
+paddleocr>=3.7.0
+onnxruntime-gpu>=1.20.0
+# CPU-only: thay onnxruntime-gpu bằng onnxruntime
+
+# CUDA 12 DLLs cho onnxruntime (Windows/Linux pip); bỏ nếu dùng driver hệ thống
+nvidia-cublas-cu12
+nvidia-cuda-nvrtc-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cudnn-cu12
+nvidia-cufft-cu12
+nvidia-curand-cu12
+nvidia-nvjitlink-cu12
+
+# === Ảnh / số ===
 pillow
 numpy
+opencv-contrib-python
+
+# === Đọc tài liệu ===
+pdfplumber
+pdf2image          # cần Poppler trên hệ thống
+pytesseract        # cần Tesseract OCR trên hệ thống (OSD xoay ảnh)
+python-docx
+openpyxl
+docling            # PDF text / pptx... (có fallback pdfplumber)
+
+# === LLM client + UI ===
+requests
+gradio

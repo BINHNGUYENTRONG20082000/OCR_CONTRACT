@@ -81,20 +81,33 @@ def to_table(data):
     return rows
 
 
-def process(file_path, use_llm, progress=gr.Progress()):
+def process(file_path, use_llm, use_ocr_correct, progress=gr.Progress()):
     """Hàm xử lý chính khi bấm nút Trích xuất."""
     if not file_path:
         return [], {}, "", None, "⚠️ Vui lòng upload file hợp đồng."
 
     extractor.use_llm = use_llm
+    extractor.use_ocr_correct = use_ocr_correct
+    markdown = ""
+    data = None
+    error = None
     try:
-        progress(0.1, desc="Đang OCR / đọc nội dung (PaddleOCR-VL)...")
+        progress(0.1, desc="Đang OCR / đọc nội dung...")
         markdown = extractor.to_markdown(file_path)
 
         progress(0.7, desc="Đang trích xuất thông tin...")
         data = extractor.extract_fields(markdown)
     except Exception as exc:
-        return [], {}, "", None, f"❌ Lỗi xử lý: {exc}"
+        error = exc
+    finally:
+        # Mặc định giữ model; chỉ xóa cache. Unload khi RELEASE_MODELS_AFTER_JOB=True.
+        if extractor.release_models_after_job:
+            extractor.close()
+        else:
+            extractor.release_cache()
+
+    if error is not None:
+        return [], {}, "", None, f"❌ Lỗi xử lý: {error}"
 
     # Ghi JSON ra file tạm để tải về
     out_dir = tempfile.mkdtemp()
@@ -121,7 +134,11 @@ with gr.Blocks(title="AIPT - Trích xuất hợp đồng", theme=gr.themes.Soft(
                 file_types=[".pdf", ".png", ".jpg", ".jpeg", ".docx", ".doc", ".md", ".txt"],
                 type="filepath",
             )
-            use_llm = gr.Checkbox(value=True, label="Dùng LLM (tắt = chỉ regex, nhanh hơn)")
+            use_llm = gr.Checkbox(value=True, label="Dùng LLM trích field (tắt = chỉ regex)")
+            use_ocr_correct = gr.Checkbox(
+                value=True,
+                label="LLM sửa chính tả OCR (ảnh/PDF scan — cần bật LLM)",
+            )
             btn = gr.Button("🚀 Trích xuất", variant="primary", size="lg")
             status = gr.Markdown("")
             json_file = gr.File(label="Tải JSON", interactive=False)
@@ -143,7 +160,7 @@ with gr.Blocks(title="AIPT - Trích xuất hợp đồng", theme=gr.themes.Soft(
 
     btn.click(
         process,
-        inputs=[file_in, use_llm],
+        inputs=[file_in, use_llm, use_ocr_correct],
         outputs=[table_out, json_out, md_out, json_file, status],
     )
 

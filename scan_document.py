@@ -325,8 +325,8 @@ def process_folder(input_dir, output_dir, engine):
 
 
 def main():
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-    engine = ocr_engine.get_engine(device="1")
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    engine = ocr_engine.get_engine(device="0")
     for folder in [
         # "regulation", 
         # "procedures", 

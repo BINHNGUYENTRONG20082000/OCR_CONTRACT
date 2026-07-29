@@ -308,6 +308,71 @@ def llm_extract(text, model, stream=False):
     return parse_json_object(content)
 
 
+# ================== LLM SỬA CHÍNH TẢ OCR ==================
+
+OCR_CORRECT_SYSTEM = (
+    "Bạn là chuyên gia chỉnh sửa kết quả OCR tiếng Việt. "
+    "Chỉ trả về văn bản đã sửa, không giải thích, không bọc markdown code fence."
+)
+
+OCR_CORRECT_USER_TEMPLATE = """Dưới đây là văn bản OCR từ hợp đồng lao động tiếng Việt — thường thiếu dấu, sai chính tả, dính chữ.
+
+Nhiệm vụ:
+1. Sửa dấu thanh / chính tả tiếng Việt cho đúng (vd: Nguyn→Nguyễn, Hà Ni→Hà Nội, HOP DÒNG→HỢP ĐỒNG, Giám đc→Giám đốc).
+2. Tách khoảng trắng hợp lý khi OCR dính chữ (vd: 024.6666.5646www.aipt→024.6666.5646 www.aipt).
+3. GIỮ nguyên cấu trúc dòng, bullet, heading markdown, số liệu, mã số, ngày tháng, email, URL.
+4. KHÔNG thêm điều khoản mới, KHÔNG xóa nội dung, KHÔNG bịa thông tin không có trong bản OCR.
+5. Nếu không chắc một từ, giữ nguyên từ OCR.
+
+Văn bản OCR:
+\"\"\"
+{content}
+\"\"\"
+"""
+
+
+def _strip_llm_text_wrapper(text):
+    """Bỏ ``` / ```markdown nếu model vẫn bọc output."""
+    if not text:
+        return text
+    text = text.strip()
+    fence = re.match(r"^```(?:markdown|md|text)?\s*\n?(.*?)\n?```\s*$", text, flags=re.DOTALL | re.IGNORECASE)
+    if fence:
+        return fence.group(1).strip()
+    return text
+
+
+def llm_correct_ocr(text, model=None, stream=False, max_chars=None):
+    """Sửa dấu/chính tả OCR bằng LLM. Lỗi hoặc output xấu -> trả về text gốc."""
+    if not text or not text.strip():
+        return text
+    slim = trim_markdown_for_llm(text, max_chars=max_chars)
+    messages = [
+        {"role": "system", "content": OCR_CORRECT_SYSTEM},
+        {"role": "user", "content": OCR_CORRECT_USER_TEMPLATE.format(content=slim)},
+    ]
+    try:
+        resp = call_chat_api(messages, model=model, stream=stream)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("LLM sửa OCR thất bại: %s -> giữ bản gốc.", exc)
+        return text
+
+    corrected = _strip_llm_text_wrapper(read_llm_content(resp, stream))
+    if not corrected or not corrected.strip():
+        logger.warning("LLM sửa OCR trả về rỗng -> giữ bản gốc.")
+        return text
+    # Bảo vệ: model đôi khi cắt quá nhiều
+    if len(corrected) < max(80, int(len(slim) * 0.45)):
+        logger.warning(
+            "LLM sửa OCR ngắn bất thường (%d -> %d) -> giữ bản gốc.",
+            len(slim), len(corrected),
+        )
+        return text
+    logger.info("Đã sửa chính tả OCR bằng LLM (%d -> %d ký tự).", len(text), len(corrected))
+    return corrected
+
+
 # ================== MERGE ==================
 
 # Các field (dạng dotted path) mà regex đáng tin hơn -> ghi đè LLM.

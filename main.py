@@ -10,7 +10,7 @@ Các trường trích xuất:
     thưởng năng lực, tổng thu nhập, quản lý trực tiếp, phòng ban.
 
 Tái sử dụng:
-    - OCR             : scan_document.py + PaddleOCR-VL
+    - OCR             : scan_document.py + PP-OCRv6
     - Trích xuất field: extract_contract_fields.py (regex + LLM)
 
 Chạy trực tiếp:
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 # ====================================================================
 DEFAULT_INPUT = "input/20260106212919160.pdf"   # file hợp đồng cần trích xuất
 
-CUDA_DEVICE = "1"                                # GPU dùng cho PaddleOCR-VL
+CUDA_DEVICE = "0"                                # GPU dùng cho PP-OCRv6 (máy 1 GPU = "0")
 
 # Giới hạn trang OCR cho file lớn (thông tin hợp đồng chủ yếu ở đầu & cuối):
 #   - PDF <= FULL_PAGE_THRESHOLD trang  -> OCR toàn bộ
@@ -49,7 +49,12 @@ TAIL_PAGES = 2
 OCR_DPI = 200              # render PDF (200 ~ đủ; 300 chậm hơn vì ảnh lớn ~14x so với screenshot)
 OCR_MAX_LONG_EDGE = 1800   # thu nhỏ cạnh dài ảnh trước Paddle infer
 
+# True = unload model sau mỗi file (tiết kiệm VRAM, lần sau phải nạp lại — chậm).
+# False = giữ model trong VRAM, chỉ xóa cache infer (nhanh hơn cho nhiều file).
+RELEASE_MODELS_AFTER_JOB = False
+
 USE_LLM = True                                   # bật trích xuất bằng LLM
+USE_OCR_CORRECT = True                           # LLM sửa dấu/chính tả sau OCR (ảnh/PDF scan)
 LLM_MODEL = os.getenv("MODEL_NAME_CORE", "")     # để "" nếu server tự chọn model
 LLM_API_URL = os.getenv("LLM_API_URL_CORE", "http://10.0.99.116:8070/v1/chat/completions")
 LLM_STREAM = False
@@ -65,6 +70,7 @@ class ContractExtractor:
     def __init__(self,
                  device=CUDA_DEVICE,
                  use_llm=USE_LLM,
+                 use_ocr_correct=USE_OCR_CORRECT,
                  llm_model=LLM_MODEL,
                  llm_api_url=LLM_API_URL,
                  llm_stream=LLM_STREAM,
@@ -73,9 +79,11 @@ class ContractExtractor:
                  tail_pages=TAIL_PAGES,
                  ocr_dpi=OCR_DPI,
                  ocr_max_long_edge=OCR_MAX_LONG_EDGE,
-                 llm_max_markdown_chars=LLM_MAX_MARKDOWN_CHARS):
+                 llm_max_markdown_chars=LLM_MAX_MARKDOWN_CHARS,
+                 release_models_after_job=RELEASE_MODELS_AFTER_JOB):
         self.device = device
         self.use_llm = use_llm
+        self.use_ocr_correct = use_ocr_correct
         self.llm_model = llm_model
         self.llm_stream = llm_stream
         self.full_page_threshold = full_page_threshold
@@ -84,6 +92,7 @@ class ContractExtractor:
         self.ocr_dpi = ocr_dpi
         self.ocr_max_long_edge = ocr_max_long_edge
         self.llm_max_markdown_chars = llm_max_markdown_chars
+        self.release_models_after_job = release_models_after_job
 
         # Đồng bộ cấu hình LLM sang module extract_contract_fields
         ecf.LLM_API_URL = llm_api_url
@@ -98,7 +107,7 @@ class ContractExtractor:
     # ---------- LAZY LOADERS ----------
 
     def _ensure_ocr(self):
-        """Khởi tạo PaddleOCR-VL, chỉ 1 lần."""
+        """Khởi tạo PP-OCRv6, chỉ 1 lần."""
         if self._engine is None:
             self._engine = ocr_engine.get_engine(
                 device=self.device,
@@ -124,51 +133,70 @@ class ContractExtractor:
         text = sd.format_markdown_elements(text)
         return text
 
+    def correct_ocr_markdown(self, markdown):
+        """Sửa dấu/chính tả OCR bằng LLM (chỉ khi bật)."""
+        if not self.use_ocr_correct:
+            return markdown
+        if not self.use_llm:
+            logger.info("Bỏ qua sửa OCR (use_llm=False).")
+            return markdown
+        logger.info("Đang sửa chính tả OCR bằng LLM...")
+        return ecf.llm_correct_ocr(
+            markdown,
+            model=self.llm_model,
+            stream=self.llm_stream,
+            max_chars=self.llm_max_markdown_chars,
+        )
+
     def to_markdown(self, file_path):
         """Chuyển file hợp đồng (PDF/ảnh/docx/xlsx/md...) sang markdown."""
         path = Path(file_path)
         ext = path.suffix.lower()
+        used_ocr = False
 
         if ext in TEXT_EXT:
-            return path.read_text(encoding="utf-8")
+            markdown = path.read_text(encoding="utf-8")
+        elif ext in IMAGE_EXT:
+            markdown = self._ocr_image(str(path))
+            used_ocr = True
+        else:
+            if ext == ".doc":
+                file_path = str(sd.convert_doc_to_docx(file_path))
+                ext = ".docx"
 
-        if ext in IMAGE_EXT:
-            return self._ocr_image(str(path))
+            if ext == ".pdf":
+                if sd.is_pdf_scan(file_path):
+                    engine = self._ensure_ocr()
+                    with tempfile.TemporaryDirectory() as tmp:
+                        markdown = sd.convert_pdf_scan(
+                            file_path, engine, tmp,
+                            full_page_threshold=self.full_page_threshold,
+                            head_pages=self.head_pages,
+                            tail_pages=self.tail_pages,
+                            dpi=self.ocr_dpi,
+                            max_long_edge=self.ocr_max_long_edge,
+                        )
+                    used_ocr = True
+                else:
+                    try:
+                        markdown = sd.convert_docling(file_path, self._ensure_converter())
+                    except Exception as exc:
+                        logger.warning("Docling lỗi (%s), fallback pdfplumber.", exc)
+                        markdown = sd.convert_pdf_text(file_path)
+            elif ext == ".docx":
+                markdown = sd.convert_docx(file_path)
+            elif ext in {".xlsx", ".xls"}:
+                markdown = sd.convert_xlsx(file_path)
+            else:
+                try:
+                    markdown = sd.convert_docling(file_path, self._ensure_converter())
+                except Exception as exc:
+                    logger.warning("Docling lỗi (%s).", exc)
+                    raise
 
-        if ext == ".doc":
-            file_path = str(sd.convert_doc_to_docx(file_path))
-            ext = ".docx"
-
-        if ext == ".pdf":
-            if sd.is_pdf_scan(file_path):
-                engine = self._ensure_ocr()
-                with tempfile.TemporaryDirectory() as tmp:
-                    return sd.convert_pdf_scan(
-                        file_path, engine, tmp,
-                        full_page_threshold=self.full_page_threshold,
-                        head_pages=self.head_pages,
-                        tail_pages=self.tail_pages,
-                        dpi=self.ocr_dpi,
-                        max_long_edge=self.ocr_max_long_edge,
-                    )
-            try:
-                return sd.convert_docling(file_path, self._ensure_converter())
-            except Exception as exc:
-                logger.warning("Docling lỗi (%s), fallback pdfplumber.", exc)
-                return sd.convert_pdf_text(file_path)
-
-        # docx / xlsx -> dùng trình đọc nhẹ (tránh phụ thuộc docling)
-        if ext == ".docx":
-            return sd.convert_docx(file_path)
-        if ext in {".xlsx", ".xls"}:
-            return sd.convert_xlsx(file_path)
-
-        # các định dạng khác (pptx...) -> docling
-        try:
-            return sd.convert_docling(file_path, self._ensure_converter())
-        except Exception as exc:
-            logger.warning("Docling lỗi (%s).", exc)
-            raise
+        if used_ocr:
+            markdown = self.correct_ocr_markdown(markdown)
+        return markdown
 
     # ---------- BƯỚC 2: MARKDOWN -> FIELDS ----------
 
@@ -189,28 +217,54 @@ class ContractExtractor:
         return ecf.merge(llm_data, rx_data)
 
     def prewarm_ocr(self):
-        """Nạp PaddleOCR-VL sẵn khi mở app (tránh chờ lần upload đầu)."""
+        """Nạp PP-OCRv6 sẵn khi mở app (tránh chờ lần upload đầu)."""
         self._ensure_ocr()
-        logger.info("Đã pre-warm PaddleOCR-VL")
+        logger.info("Đã pre-warm PP-OCRv6")
 
     # ---------- PIPELINE ĐẦY ĐỦ ----------
 
     def run(self, file_path, save=True):
         """Chạy toàn bộ pipeline cho 1 file, trả về dict; tùy chọn lưu .fields.json."""
         logger.info("Đang xử lý: %s", file_path)
-        markdown = self.to_markdown(file_path)
-        data = self.extract_fields(markdown)
-        if save:
-            out_path = Path(file_path).with_suffix(".fields.json")
-            out_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            logger.info("Đã lưu: %s", out_path)
-        return data
+        try:
+            markdown = self.to_markdown(file_path)
+            data = self.extract_fields(markdown)
+            if save:
+                out_path = Path(file_path).with_suffix(".fields.json")
+                out_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                logger.info("Đã lưu: %s", out_path)
+            return data
+        finally:
+            if self.release_models_after_job:
+                self.close()
+            else:
+                self.release_cache()
+
+    def release_cache(self):
+        """Giữ model, chỉ xóa cache CUDA/activation sau infer."""
+        ocr_engine.clear_cuda_cache()
 
     def close(self):
-        """Giải phóng engine OCR khỏi GPU."""
-        if self._engine is not None and hasattr(self._engine, "close"):
-            self._engine.close()
-        self._engine = None
+        """Giải phóng OCR + docling khỏi RAM/VRAM."""
+        if self._engine is not None:
+            if hasattr(self._engine, "close"):
+                try:
+                    self._engine.close()
+                except Exception as exc:
+                    logger.warning("Lỗi khi close OCR engine: %s", exc)
+            self._engine = None
+
+        if self._converter is not None:
+            try:
+                close_fn = getattr(self._converter, "close", None)
+                if callable(close_fn):
+                    close_fn()
+            except Exception:
+                pass
+            self._converter = None
+
+        ocr_engine.clear_cuda_cache()
+        logger.info("Đã giải phóng tài nguyên OCR/docling")
 
 
 def main():
