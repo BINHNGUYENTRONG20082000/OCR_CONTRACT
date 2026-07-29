@@ -19,6 +19,8 @@ Chạy trực tiếp:
     python main.py input/foo.md --no-llm # chỉ regex
 """
 
+import model_cache  # noqa: F401  — cấu hình ./model trước khi nạp paddle/docling
+
 import argparse
 import json
 import logging

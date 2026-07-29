@@ -1,3 +1,5 @@
+import model_cache  # noqa: F401  — ./model trước khi nạp OCR/docling
+
 import re
 import json
 import logging

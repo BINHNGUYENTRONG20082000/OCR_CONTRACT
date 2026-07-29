@@ -8,6 +8,8 @@ Chạy:
 Mặc định mở tại http://0.0.0.0:7862
 """
 
+import model_cache  # noqa: F401  — cấu hình ./model trước khi nạp paddle/docling
+
 import json
 import logging
 import tempfile

@@ -1,3 +1,4 @@
+import model_cache  # noqa: F401
 import os
 from pathlib import Path
 

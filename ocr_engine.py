@@ -6,6 +6,8 @@
 Hậu xử lý (clean_empty_tables / format_markdown_elements) do scan_document đảm nhiệm.
 """
 
+import model_cache  # noqa: F401  — ./model trước khi import paddleocr
+
 import gc
 import logging
 import os
