@@ -4,7 +4,7 @@ Chiến lược lai (hybrid):
   - REGEX  : xử lý các trường có format cố định (số HĐ, CCCD, ngày cấp, BHXH,
              MST cá nhân, ngày tháng, thời hạn) -> độ chính xác cao, ghi đè LLM.
   - LLM    : xử lý các trường ngữ nghĩa (chức vụ, phòng ban, quản lý trực tiếp,
-             loại hợp đồng) và tiền lương/phụ cấp (xử lý được trường hợp gộp/thiếu).
+             loại hợp đồng) và tiền lương/phụ cấp (xăng xe ≠ điện thoại, không gộp).
   - MERGE  : gộp 2 kết quả, regex thắng ở nhóm ID/ngày, LLM bù cho phần còn lại.
 
 Cách dùng:
@@ -185,6 +185,25 @@ def _norm_money(raw):
     return re.sub(r"\s+", " ", raw).strip()
 
 
+_MONEY_TAIL = r"((?:\d{1,3}(?:\.\d{3})*|\d+)\s*VN[ĐD][^\n]*)"
+
+
+def _money_labeled(text, label_re):
+    """Lấy số tiền sau nhãn (Phụ cấp|Hỗ trợ|Thưởng|Lương ...). Bỏ qua dòng gộp nhiều loại (có dấu phẩy)."""
+    pat = (
+        rf"(?:^|\n)\s*[-•*]?\s*(?:{label_re})\s*:?\s*{_MONEY_TAIL}"
+    )
+    m = re.search(pat, text, flags=re.IGNORECASE | re.MULTILINE)
+    if not m:
+        return None
+    # Dòng gộp kiểu "Hỗ trợ xăng xe, điện thoại: 500.000" — không gán cho 1 loại
+    line = m.group(0)
+    head = line.split(":")[0] if ":" in line else line
+    if "," in head or ";" in head:
+        return None
+    return _norm_money(m.group(1))
+
+
 def _extract_loai_hop_dong(text):
     """Tiêu đề hợp đồng chính ở đầu văn bản (không lấy PHỤ LỤC, không suy từ thời hạn)."""
     for m in re.finditer(
@@ -243,13 +262,39 @@ def regex_extract(text):
     out["dia_chi_thuong_tru"] = _first(r"Địa chỉ thường trú:\s*([^\n]+)", text)
     out["dia_chi_hien_tai"] = _first(r"Địa chỉ hiện tại:\s*([^\n]+)", text)
 
-    # Tiền (fallback nếu LLM không lấy được)
-    out["luong_co_ban"] = _norm_money(_first(r"Lương cơ bản\s*:?\s*([\d\.]+\s*VN[ĐD][^\n]*)", text))
-    out["thuong_nang_luc"] = _norm_money(
-        _first(r"Thưởng\s*năng\s*lực\s*:?\s*([^\n]+)", text)
-        or _first(r"Thưởng\s*NL\s*:?\s*([^\n]+)", text)
+    # Tiền — regex neo đúng nhãn (ghi đè LLM khi bị đảo xăng xe ↔ điện thoại)
+    out["luong_co_ban"] = (
+        _money_labeled(text, r"Lương\s*cơ\s*bản")
+        or _money_labeled(text, r"Lương\s*hợp\s*đồng")
     )
-    out["tong_thu_nhap"] = _norm_money(_first(r"Tổng thu nhập:\s*([\d\.]+\s*VN[ĐD][^\n]*)", text))
+    out["thuong_nang_luc"] = (
+        _money_labeled(text, r"Thưởng\s*năng\s*lực")
+        or _money_labeled(text, r"Thưởng\s*NL")
+    )
+    out["tong_thu_nhap"] = _money_labeled(text, r"Tổng\s*thu\s*nhập")
+
+    # Phụ cấp / hỗ trợ: mỗi loại một dòng riêng — KHÔNG gộp, KHÔNG đảo
+    phu = {}
+    phu["xang_xe"] = _money_labeled(
+        text, r"(?:Phụ\s*cấp|Hỗ\s*trợ)\s+xăng\s*xe"
+    )
+    phu["dien_thoai"] = _money_labeled(
+        text, r"(?:Phụ\s*cấp|Hỗ\s*trợ)\s+điện\s*thoại"
+    )
+    phu["an_trua"] = _money_labeled(
+        text, r"(?:Phụ\s*cấp|Hỗ\s*trợ)\s+ăn\s*trưa"
+    )
+    phu["trach_nhiem"] = _money_labeled(
+        text, r"(?:Phụ\s*cấp|Hỗ\s*trợ)\s+trách\s*nhiệm"
+    )
+    phu["hqcv"] = (
+        _money_labeled(text, r"(?:Phụ\s*cấp|Hỗ\s*trợ)\s*(?:HQCV|hiệu\s*quả(?:\s*công\s*việc)?)")
+        or _money_labeled(text, r"Thưởng\s*hiệu\s*quả\s*công\s*việc")
+        or _money_labeled(text, r"Thưởng\s*HQCV")
+    )
+    phu = {k: v for k, v in phu.items() if v}
+    if phu:
+        out["phu_cap"] = phu
 
     return {k: v for k, v in out.items() if v}
 
@@ -265,6 +310,7 @@ USER_PROMPT_TEMPLATE = """Trích xuất thông tin từ nội dung hợp đồng
 
 Quy tắc bắt buộc:
 - Trường nào không tìm thấy trong văn bản thì để null. TUYỆT ĐỐI không bịa.
+  NGOẠI LỆ: các trường tiền tệ (xem mục bên dưới) — thiếu số liệu thì trả "0 VNĐ/tháng", không để null.
 - "mst_ca_nhan" là mã số thuế của NGƯỜI LAO ĐỘNG (cá nhân), KHÔNG lấy mã số thuế của Công ty.
 - "vi_tri_cong_viec" = chức danh công việc của người lao động; "chuc_vu" có thể giống vi_tri_cong_viec.
 - "loai_hop_dong": lấy ĐÚNG tiêu đề hợp đồng ở đầu văn bản (vd "### HỢP ĐỒNG LAO ĐỘNG", "HỢP ĐỒNG THỬ VIỆC").
@@ -272,12 +318,25 @@ Quy tắc bắt buộc:
   — số tháng thuộc trường "thoi_han_hop_dong", không gộp vào loại hợp đồng.
   Nếu tiêu đề chỉ ghi "HỢP ĐỒNG LAO ĐỘNG" thì trả đúng như vậy, không đổi thành "HỢP ĐỒNG LAO ĐỘNG có thời hạn".
   Bỏ qua tiêu đề "PHỤ LỤC HỢP ĐỒNG ...".
-- Thông tin lương/phụ cấp/thưởng năng lực/tổng thu nhập thường nằm ở phần PHỤ LỤC, hãy đọc hết văn bản.
-- "thuong_nang_luc": thưởng năng lực (có thể ghi "Thưởng năng lực", "Thưởng NL"); lấy số tiền hoặc mô tả đúng như văn bản.
-- Nếu một dòng phụ cấp gộp nhiều loại (vd "Phụ cấp xăng xe, điện thoại: 500.000"),
-  hãy điền CÙNG giá trị đó cho từng loại liên quan (xang_xe và dien_thoai).
-- "hqcv" = phụ cấp hiệu quả/hoàn thành công việc.
-- Giữ nguyên định dạng số tiền như trong văn bản (vd "5.007.600 VNĐ/tháng").
+- Thông tin lương/phụ cấp/thưởng/tổng thu nhập thường nằm ở phần PHỤ LỤC, hãy đọc hết văn bản.
+
+Các trường tiền tệ (bắt buộc cùng quy tắc):
+  luong_co_ban, phu_cap.xang_xe, phu_cap.dien_thoai, phu_cap.an_trua,
+  phu_cap.trach_nhiem, phu_cap.hqcv, thuong_nang_luc, tong_thu_nhap.
+- CHỈ trả về số tiền dạng "X.XXX.XXX VNĐ/tháng" hoặc "0 VNĐ/tháng".
+- Giữ nguyên định dạng số tiền như trong văn bản khi có số liệu (vd "5.007.600 VNĐ/tháng").
+- Nếu không có số tiền rõ ràng (thiếu dòng, ghi "theo quy chế", hoặc chỉ có đoạn giải thích/điều kiện)
+  thì trả "0 VNĐ/tháng". TUYỆT ĐỐI không điền đoạn mô tả/giải thích vào bất kỳ trường tiền nào.
+- "luong_co_ban": nhãn có thể là "Lương cơ bản" hoặc "Lương hợp đồng".
+- Nhãn "Hỗ trợ ..." và "Phụ cấp ..." là cùng nghĩa (vd "Hỗ trợ xăng xe" = phu_cap.xang_xe).
+- "phu_cap.xang_xe" và "phu_cap.dien_thoai" là HAI loại KHÁC NHAU. ĐỌC ĐÚNG nhãn từng dòng,
+  TUYỆT ĐỐI không đảo số tiền giữa chúng. Ví dụ:
+    Hỗ trợ xăng xe: 0 VNĐ/tháng        → xang_xe = "0 VNĐ/tháng"
+    Hỗ trợ điện thoại: 500.000 VNĐ/tháng → dien_thoai = "500.000 VNĐ/tháng"
+  Nếu ghi gộp chung (vd "Phụ cấp xăng xe, điện thoại: 500.000") mà không tách số từng loại
+  thì cả xang_xe và dien_thoai = "0 VNĐ/tháng" (không tự chia, không nhân đôi).
+- "phu_cap.hqcv" = phụ cấp/thưởng hiệu quả công việc (HQCV, "Thưởng hiệu quả công việc").
+- "thuong_nang_luc": nhãn "Thưởng năng lực" / "Thưởng NL".
 
 Schema JSON:
 {schema}
@@ -390,14 +449,36 @@ REGEX_OVERRIDE = {
     "dia_chi_hien_tai",
     "loai_hop_dong",
     "phong_ban",
+    # Neo nhãn tiền — tránh LLM đảo xăng xe ↔ điện thoại
+    "luong_co_ban",
+    "phu_cap.xang_xe",
+    "phu_cap.dien_thoai",
+    "phu_cap.an_trua",
+    "phu_cap.trach_nhiem",
+    "phu_cap.hqcv",
+    "thuong_nang_luc",
+    "tong_thu_nhap",
 }
 
+# Field tiền tệ: sau merge luôn chuẩn hóa → số tiền hoặc "0 VNĐ/tháng"
+MONEY_FIELDS = (
+    "luong_co_ban",
+    "phu_cap.xang_xe",
+    "phu_cap.dien_thoai",
+    "phu_cap.an_trua",
+    "phu_cap.trach_nhiem",
+    "phu_cap.hqcv",
+    "thuong_nang_luc",
+    "tong_thu_nhap",
+)
+
 # Field thường trống trên mẫu -> không bắt buộc gọi LLM vì thiếu các field này
-OPTIONAL_FIELDS = frozenset({"phu_cap.an_trua"})
+OPTIONAL_FIELDS = frozenset({"phu_cap.an_trua"}) | frozenset(MONEY_FIELDS)
 
 # Từ khóa giữ lại khi rút gọn markdown gửi LLM (phụ lục / lương)
 _LLM_KEEP_KEYWORDS = re.compile(
-    r"phụ\s*lục|phu\s*luc|lương|luong|phụ\s*cấp|phu\s*cap|thu\s*nhập|thưởng|thuong|năng\s*lực|PLHĐ|PLHD",
+    r"phụ\s*lục|phu\s*luc|lương|luong|phụ\s*cấp|phu\s*cap|hỗ\s*trợ|ho\s*tro|"
+    r"thu\s*nhập|thưởng|thuong|năng\s*lực|xăng|điện\s*thoại|PLHĐ|PLHD",
     re.IGNORECASE,
 )
 
@@ -478,9 +559,46 @@ def merge(llm_data, rx_data):
         if path in REGEX_OVERRIDE or _get(result, path) in (None, ""):
             _set(result, path, rx_val)
 
+    # 3) Chuẩn hóa mọi trường tiền: chỉ số tiền; thiếu/giải thích → "0 VNĐ/tháng"
+    for path in MONEY_FIELDS:
+        _set(result, path, _normalize_money_value(_get(result, path)))
+
     return result
 
 
+_MONEY_VALUE_RE = re.compile(
+    r"^\s*(?:\d{1,3}(?:\.\d{3})*|\d+)\s*(?:VN[ĐD].*)?\s*$",
+    re.IGNORECASE,
+)
+
+_ZERO_MONEY = "0 VNĐ/tháng"
+
+
+def _normalize_money_value(val):
+    """Chỉ chấp nhận số tiền; null/mô tả/giải thích → '0 VNĐ/tháng'."""
+    if val is None:
+        return _ZERO_MONEY
+    if isinstance(val, (int, float)):
+        if float(val) == 0:
+            return _ZERO_MONEY
+        if float(val) == int(val):
+            return f"{int(val):,}".replace(",", ".") + " VNĐ/tháng"
+        return f"{val} VNĐ/tháng"
+    text = re.sub(r"\s+", " ", str(val)).strip()
+    if not text:
+        return _ZERO_MONEY
+    # "0" / "0đ" thuần → chuẩn hóa cùng format
+    if re.fullmatch(r"0+(?:\s*VN[ĐD].*)?", text, flags=re.IGNORECASE):
+        return _ZERO_MONEY
+    if _MONEY_VALUE_RE.match(text):
+        if not re.search(r"VN[ĐD]", text, re.IGNORECASE):
+            return f"{text} VNĐ/tháng"
+        return text
+    # Số tiền nhúng trong câu ngắn → lấy cụm tiền; câu dài = giải thích → 0
+    m = re.search(r"((?:\d{1,3}(?:\.\d{3})*|\d+)\s*VN[ĐD][^\n,]*)", text, re.IGNORECASE)
+    if m and len(text) <= 40:
+        return _norm_money(m.group(1))
+    return _ZERO_MONEY
 # ================== PIPELINE ==================
 
 def process_file(md_path, model, use_llm=True, stream=False):
